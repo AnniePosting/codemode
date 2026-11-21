@@ -55,7 +55,9 @@ function makeShell(tools) {
     let started
     const run = () => (started ??= (async () => {
       let c = cmd
-      if (opt.env) c = Object.entries(opt.env).map(([k, v]) => k + '=' + q(v)).join(' ') + ' ' + c
+      // Exported in a subshell, so the variables reach every command of a compound line (`a && b`, pipes), not just
+      // the first word, and do not leak into the Bash tool's persistent shell.
+      if (opt.env) c = '(export ' + Object.entries(opt.env).map(([k, v]) => k + '=' + q(v)).join(' ') + '; ' + c + ')'
       if (opt.cwd) c = 'cd ' + q(opt.cwd) + ' && ' + c
       let out
       try {

@@ -246,12 +246,15 @@ async function toolReply($: any, real: Map<string, string>, m: any, log?: Call[]
     if (tool === 'Skill') throw new Error('a skill cannot be loaded from a script here (its instructions would not reach you): call the Skill tool directly')
     const r: any = shim ? await $.tool.call({ tool: 'Bash', command: shimCommand(shim, m.input ?? {}) } as any) : await $.tool.call({ ...m.input, tool } as any)
     if (r.deny !== undefined) throw new Error(String(r.deny))
-    if (r.isError) throw new Error(r.text ?? 'tool failed')
-    const body = await unwrap($, String(r.text ?? ''))
+    // A failed tool's text (a non-zero exit's output included) reaches the script whole, like a successful one's.
+    if (r.isError) throw new Error(await unwrap($, String(r.text ?? 'tool failed')))
+    // The Bash tool reports empty output as a sentence; to a script it is the empty string it really was.
+    const raw = await unwrap($, String(r.text ?? ''))
+    const body = tool === 'Bash' && raw === '(Bash completed with no output)' ? '' : raw
     note(tool, body, false)
     const ctx = Array.isArray(r.context) ? r.context.map((c: any) => (typeof c === 'string' ? c : c?.text ?? '')).filter(Boolean).join('\n') : ''
     return { text: body + (ctx ? '\n' + ctx : '') }
-  } catch (err: any) { note((real.get(m.tool) ?? m.tool).replace(/^shim:/, ''), String(err?.message ?? err), true); return { error: String(err?.message ?? err).slice(0, 500) } }
+  } catch (err: any) { note((real.get(m.tool) ?? m.tool).replace(/^shim:/, ''), String(err?.message ?? err), true); return { error: String(err?.message ?? err) } }
 }
 
 async function finish($: any, done: any, t0: number, maxTokens: number, spill: string) {
