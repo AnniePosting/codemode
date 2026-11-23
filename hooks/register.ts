@@ -141,24 +141,12 @@ const notices = new Map<string, string>() // one-line warnings shown with the ne
 const daemons = new Map<string, Daemon>() // one REPL per agent: the main loop's globals are not a subagent's, and a long run in one does not queue the other
 let seq = 0
 let mainBusy = false // whether the main loop is mid-turn (turn.start .. turn.complete)
-let deliverer: any = null // a $ that outlives its hook, used to wake the idle session
 
 // Takes every finished background result for an agent, once.
 function drain(key: string): string[] {
   const got = finished.get(key) ?? []
   finished.set(key, [])
   return got
-}
-
-// Wakes an idle main loop with finished background results, the way a background Bash task's notification does.
-// Mid-turn nothing is sent: the results ride the next exec result or, at turn end, this same call.
-async function wake($: any) {
-  if (mainBusy || !(finished.get('main')?.length)) return
-  const got = drain('main')
-  const left = detached.get('main') ?? 0
-  try {
-    await $.prompt.submit({ text: ['Code mode: background script output.', ...got, left ? `${left} script(s) still running in the background.` : ''].filter(Boolean).join('\n\n') })
-  } catch { finished.set('main', [...got, ...(finished.get('main') ?? [])]) } // not delivered: leave it for poll or the next exec
 }
 
 function trackLog(e: any): Call[] | undefined {
@@ -372,7 +360,7 @@ async function runExecInner($: any, e: any): Promise<any> {
     // Still running: detach. The script goes on; its result lands in a file.
     const out = `${d.dir}/result${run}.txt`
     detached.set(key, (detached.get(key) ?? 0) + 1)
-    void pump(false).then(conclude).then(async (r: any) => { await $.fs.write(out, r.result); finished.set(key, [...(finished.get(key) ?? []), `Script #${run} finished (also in ${out}):\n${r.result}`]) }).catch(async (err: any) => { await $.fs.write(out, `Script failed: ${err?.message ?? err}`).catch(() => {}); finished.set(key, [...(finished.get(key) ?? []), `Script #${run} failed: ${err?.message ?? err}`]) }).finally(async () => { detached.set(key, (detached.get(key) ?? 1) - 1); files = []; if (key === 'main') await wake(deliverer ?? $) })
+    void pump(false).then(conclude).then(async (r: any) => { await $.fs.write(out, r.result); finished.set(key, [...(finished.get(key) ?? []), `Script #${run} finished (also in ${out}):\n${r.result}`]) }).catch(async (err: any) => { await $.fs.write(out, `Script failed: ${err?.message ?? err}`).catch(() => {}); finished.set(key, [...(finished.get(key) ?? []), `Script #${run} failed: ${err?.message ?? err}`]) }).finally(async () => { detached.set(key, (detached.get(key) ?? 1) - 1); files = []; })
     files = []
     return { result: `Script #${run} is still running after ${DETACH_MS / 1000}s and has been detached to the background (limit ${ASYNC_WALL_CAP_MS / 3600000} h). Its calls go on. The next script starts now and runs beside it; they share variables. When it ends, its output is written to ${out} and delivered to you on its own (with your next exec result, or as a new message once your turn ends): do not poll in a loop.` } as any
   } catch (err: any) {
@@ -434,6 +422,16 @@ export const register: Register = (on) => {
         inputSchema: { type: 'object', properties: {} },
         isDeferred: false,
       })
+      // Wakes an idle main loop with finished background results, the way a background Bash task's notification does.
+      // Mid-turn nothing is sent: the results ride the next exec result, or this timer once the turn ends.
+      $.clock.every(1000, async () => {
+        if (mainBusy || !(finished.get('main')?.length)) return
+        const got = drain('main')
+        const left = detached.get('main') ?? 0
+        try {
+          await $.prompt.submit({ text: ['Code mode: background script output.', ...got, left ? `${left} script(s) still running in the background.` : ''].filter(Boolean).join('\n\n') })
+        } catch { finished.set('main', [...got, ...(finished.get('main') ?? [])]) } // not delivered: leave it for poll or the next exec
+      })
       ready = true
     } catch {} // a failed registration must never break the session (and then nothing is hidden or denied)
     return next(e)
@@ -479,20 +477,18 @@ export const register: Register = (on) => {
 
   // Track whether the main loop is mid-turn; at a turn's end, hand over any background output that finished meanwhile.
   on('turn.start', async ($, e: any, next) => {
-    if (e.agentId === undefined) { mainBusy = true; deliverer = $ }
+    if (e.agentId === undefined) mainBusy = true
     return next(e)
   })
   on('turn.complete', async ($, e: any, next) => {
     const r = await next(e)
     if (e.agentId === undefined) {
       mainBusy = false
-      deliverer = $
-      if (finished.get('main')?.length) $.clock.after(300, () => wake($))
     }
     return r
   })
 
-  on('tool.call', { tool: EXEC }, async ($, e: any, next) => {
+  on('tool.call', { tool: EXEC as any }, async ($, e: any, next) => {
     return await runExec($, e)
   })
 
@@ -504,9 +500,9 @@ export const register: Register = (on) => {
     return /^(Note: [^\n]*\n)?Script failed\b/.test(t) ? t.split('\n').filter((l) => /Script (failed|error)|Error/.test(l)).slice(0, 3).join('\n') : ''
   }
   on('ui.render', { component: 'ToolUse', props: { tool: EXEC } } as any, async ($, e: any, next) => {
-    if (!FORCE || !ready) return next(e)
+    if (!FORCE || !ready) return next(e as never)
     try {
-      const { Box, Text, Button } = $.ui.resolve(e)
+      const { Box, Text, Button } = $.ui.resolve(e as never) as any
       const p = e.props
       const calls = logs.get(p.tool_use_id) ?? []
       const sum = summarise(calls)
@@ -524,13 +520,13 @@ export const register: Register = (on) => {
       const bad = !p.isRunning && !p.isExpanded ? failure(p.output) : ''
       if (bad) rows.push(Text({ color: 'red', children: bad }))
       return Box({ flexDirection: 'column', marginY: 1, paddingLeft: 2, children: rows })
-    } catch { return next(e) }
+    } catch { return next(e as never) }
   })
   on('ui.render', { component: 'ToolResult', props: { tool: EXEC } } as any, async ($, e: any, next) => {
-    if (!FORCE || !ready) return next(e)
+    if (!FORCE || !ready) return next(e as never)
     try {
-      if (e.props.isExpanded) return next(e) // ctrl+o: the model's own result text, as it is
-      return $.ui.resolve(e).Box({ display: 'none', children: [] })
-    } catch { return next(e) }
+      if (e.props.isExpanded) return next(e as never) // ctrl+o: the model's own result text, as it is
+      return ($.ui.resolve(e as never) as any).Box({ display: 'none', children: [] })
+    } catch { return next(e as never) }
   })
 }
