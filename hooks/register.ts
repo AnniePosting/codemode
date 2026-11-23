@@ -21,6 +21,7 @@ const TOOL_CALL_CAP = 50000
 const DETACH_MS = 30000 // a script still running after this is detached to the background
 const ASYNC_WALL_CAP_MS = 7200000 // and may run this long
 const SYNC_MS = 30000 // a script's synchronous stretch is stopped after this
+const POLL_MAX_MS = 600000 // poll blocks until a background script finishes, at most this long
 const HIDDEN = new Set(['Glob', 'Grep', 'Bash', 'PowerShell', 'NotebookEdit'])
 // Read is the one hidden tool with a carve-out: a script only gets text back, so images (screenshots) and PDFs can only be seen through a direct Read call.
 const VISUAL = /\.(png|jpe?g|gif|webp|bmp|heic|avif|pdf)$/i
@@ -102,10 +103,10 @@ Available inside a script:
 - tools.<name>(input) calls any tool with the input it normally takes. Characters that are not valid in an identifier become _, so mcp__a-b__c is tools.mcp__a_b__c. tools.Glob and tools.Grep exist (ripgrep).
 - searchTools(query, max) and describeTool(name) find tools; sleep(ms); log(...); text(x); preview(x, n); store(key, value) and load(key); running() lists scripts and abort() stops one; setTimeout and setInterval (they stop when the script ends); console.* goes to a ring buffer that console.tail(n) reads back.
 Everything that touches the outside world returns a promise, so await it (file(p).text() is a promise, not a string). Large tool results arrive whole.
-Scripts begin in the order sent. One that runs longer than ${DETACH_MS / 1000}s moves to the background (it may live up to ${ASYNC_WALL_CAP_MS / 3600000} h): the call returns at once, the next script starts alongside it with the same variables, and the finished output comes back through the ${POLL} tool and is saved to a file. \`timeout\` caps a script's own running time in ms (default 30000, max ${MAX_TIMEOUT_MS}); time spent waiting on tool calls does not count. A script may make ${TOOL_CALL_CAP} tool calls, and any synchronous stretch (code between awaits) is cut off after ${SYNC_MS / 1000}s. A first line of \`// @cancel\` aborts every running script but keeps your variables. Skills load through the Skill tool, not from a script.
+Scripts begin in the order sent. One that runs longer than ${DETACH_MS / 1000}s moves to the background (it may live up to ${ASYNC_WALL_CAP_MS / 3600000} h): the call returns at once, the next script starts alongside it with the same variables, and its output is saved to a file and delivered to you on its own: with your next exec result if you are mid-turn, or as a new message that wakes you if you have ended your turn. So do not poll in a loop: do other work or end your turn. Call ${POLL} only when you must block on the result; it waits until a background script finishes (up to ${POLL_MAX_MS / 60000} min). \`timeout\` caps a script's own running time in ms (default 30000, max ${MAX_TIMEOUT_MS}); time spent waiting on tool calls does not count. A script may make ${TOOL_CALL_CAP} tool calls, and any synchronous stretch (code between awaits) is cut off after ${SYNC_MS / 1000}s. A first line of \`// @cancel\` aborts every running script but keeps your variables. Skills load through the Skill tool, not from a script.
 Example: const hits = (await $\`rg -l FIXME src\`.nothrow()).lines(); ({total: hits.length, sample: hits.slice(0, 5)})`
 
-const GUIDANCE = `Code mode is active. Bash, Glob, Grep, PowerShell, NotebookEdit and Read-for-text are not available as direct calls; route that work through ${EXEC} scripts (shell with $\`...\`, files with file(), write() and edit(), anything else with tools.<name>()). Variables persist between scripts, so collect what a decision needs in one script and return only that. One exception: Read on an image (screenshot, png, jpg, gif, webp) or a PDF is called directly, because a script can only return text, not pixels. A script that outlasts ${DETACH_MS / 1000}s moves to the background and its result comes back through ${POLL}.`
+const GUIDANCE = `Code mode is active. Bash, Glob, Grep, PowerShell, NotebookEdit and Read-for-text are not available as direct calls; route that work through ${EXEC} scripts (shell with $\`...\`, files with file(), write() and edit(), anything else with tools.<name>()). Variables persist between scripts, so collect what a decision needs in one script and return only that. One exception: Read on an image (screenshot, png, jpg, gif, webp) or a PDF is called directly, because a script can only return text, not pixels. A script that outlasts ${DETACH_MS / 1000}s moves to the background; its result is delivered to you automatically (with your next exec result, or as a new message once your turn has ended), so never poll in a loop.`
 
 export function parse(src: string): { code: string; opts: { max_output_tokens?: number; timeout_ms?: number } } {
   const m = /^\/\/ @options:(.*)\n?/.exec(src)
@@ -139,6 +140,26 @@ const finished = new Map<string, string[]>() // per agent: output of detached sc
 const notices = new Map<string, string>() // one-line warnings shown with the next result, e.g. that the REPL restarted and lost its variables
 const daemons = new Map<string, Daemon>() // one REPL per agent: the main loop's globals are not a subagent's, and a long run in one does not queue the other
 let seq = 0
+let mainBusy = false // whether the main loop is mid-turn (turn.start .. turn.complete)
+let deliverer: any = null // a $ that outlives its hook, used to wake the idle session
+
+// Takes every finished background result for an agent, once.
+function drain(key: string): string[] {
+  const got = finished.get(key) ?? []
+  finished.set(key, [])
+  return got
+}
+
+// Wakes an idle main loop with finished background results, the way a background Bash task's notification does.
+// Mid-turn nothing is sent: the results ride the next exec result or, at turn end, this same call.
+async function wake($: any) {
+  if (mainBusy || !(finished.get('main')?.length)) return
+  const got = drain('main')
+  const left = detached.get('main') ?? 0
+  try {
+    await $.prompt.submit({ text: ['Code mode: background script output.', ...got, left ? `${left} script(s) still running in the background.` : ''].filter(Boolean).join('\n\n') })
+  } catch { finished.set('main', [...got, ...(finished.get('main') ?? [])]) } // not delivered: leave it for poll or the next exec
+}
 
 function trackLog(e: any): Call[] | undefined {
   const id = e.tool_use_id
@@ -233,6 +254,14 @@ function shimCommand(kind: string, i: any): string {
   return `rg ${f.join(' ')} -e ${sq(i.pattern)} -- ${path} 2>&1${head}; true`
 }
 
+// A failed tool's text reaches the script whole up to this many characters; beyond that the middle is cut, head and tail kept.
+const ERROR_MAX = 8000
+function capError(s: string): string {
+  if (s.length <= ERROR_MAX) return s
+  const half = ERROR_MAX / 2
+  return s.slice(0, half) + `\n[… ${s.length - ERROR_MAX} more characters …]\n` + s.slice(-half)
+}
+
 async function toolReply($: any, real: Map<string, string>, m: any, log?: Call[]): Promise<object> {
   const note = (tool: string, text: string, err: boolean) => {
     if (!log || tool === 'ToolSearch') return
@@ -254,7 +283,7 @@ async function toolReply($: any, real: Map<string, string>, m: any, log?: Call[]
     note(tool, body, false)
     const ctx = Array.isArray(r.context) ? r.context.map((c: any) => (typeof c === 'string' ? c : c?.text ?? '')).filter(Boolean).join('\n') : ''
     return { text: body + (ctx ? '\n' + ctx : '') }
-  } catch (err: any) { note((real.get(m.tool) ?? m.tool).replace(/^shim:/, ''), String(err?.message ?? err), true); return { error: String(err?.message ?? err) } }
+  } catch (err: any) { note((real.get(m.tool) ?? m.tool).replace(/^shim:/, ''), String(err?.message ?? err), true); return { error: capError(String(err?.message ?? err)) } }
 }
 
 async function finish($: any, done: any, t0: number, maxTokens: number, spill: string) {
@@ -287,6 +316,8 @@ async function runExec($: any, e: any): Promise<any> {
   const r = await runExecInner($, e)
   const key = agentKey(e), note = notices.get(key)
   if (note && typeof r?.result === 'string') { notices.delete(key); r.result = `${note}\n${r.result}` }
+  const bg = typeof r?.result === 'string' ? drain(key) : []
+  if (bg.length) r.result = `${r.result}\n\n[Background scripts that finished meanwhile]\n${bg.join('\n\n')}`
   return r
 }
 
@@ -341,9 +372,9 @@ async function runExecInner($: any, e: any): Promise<any> {
     // Still running: detach. The script goes on; its result lands in a file.
     const out = `${d.dir}/result${run}.txt`
     detached.set(key, (detached.get(key) ?? 0) + 1)
-    void pump(false).then(conclude).then(async (r: any) => { await $.fs.write(out, r.result); finished.set(key, [...(finished.get(key) ?? []), `Script #${run} finished (also in ${out}):\n${r.result}`]) }).catch(async (err: any) => { await $.fs.write(out, `Script failed: ${err?.message ?? err}`).catch(() => {}); finished.set(key, [...(finished.get(key) ?? []), `Script #${run} failed: ${err?.message ?? err}`]) }).finally(() => { detached.set(key, (detached.get(key) ?? 1) - 1); files = [] })
+    void pump(false).then(conclude).then(async (r: any) => { await $.fs.write(out, r.result); finished.set(key, [...(finished.get(key) ?? []), `Script #${run} finished (also in ${out}):\n${r.result}`]) }).catch(async (err: any) => { await $.fs.write(out, `Script failed: ${err?.message ?? err}`).catch(() => {}); finished.set(key, [...(finished.get(key) ?? []), `Script #${run} failed: ${err?.message ?? err}`]) }).finally(async () => { detached.set(key, (detached.get(key) ?? 1) - 1); files = []; if (key === 'main') await wake(deliverer ?? $) })
     files = []
-    return { result: `Script #${run} is still running after ${DETACH_MS / 1000}s and has been detached to the background (limit ${ASYNC_WALL_CAP_MS / 3600000} h). Its calls go on. The next script starts now and runs beside it; they share variables. When it ends, its output arrives with ${POLL} and is written to ${out}.` } as any
+    return { result: `Script #${run} is still running after ${DETACH_MS / 1000}s and has been detached to the background (limit ${ASYNC_WALL_CAP_MS / 3600000} h). Its calls go on. The next script starts now and runs beside it; they share variables. When it ends, its output is written to ${out} and delivered to you on its own (with your next exec result, or as a new message once your turn ends): do not poll in a loop.` } as any
   } catch (err: any) {
     return { result: `Script failed: ${err?.message ?? err}` } as any
   } finally {
@@ -399,7 +430,7 @@ export const register: Register = (on) => {
       })
       await $.tool.register({
         name: 'poll',
-        description: 'Collect the output of scripts that moved to the background. If none has finished yet it waits about 20 s, then reports what is still running.',
+        description: `Block until a background script finishes and return its output (waits up to ${POLL_MAX_MS / 60000} min). Rarely needed: finished output is delivered to you automatically, with your next exec result or as a new message once your turn ends.`,
         inputSchema: { type: 'object', properties: {} },
         isDeferred: false,
       })
@@ -438,12 +469,27 @@ export const register: Register = (on) => {
   on('tool.call', { tool: POLL as any }, async ($, e: any, next) => {
     const key = agentKey(e)
     const t0 = await $.clock.now()
-    while (!(finished.get(key)?.length) && (detached.get(key) ?? 0) > 0 && (await $.clock.now()) - t0 < 20000) await $.process.run(['sleep', '1']) // a $ call in flight keeps the hook inside its budget
+    while (!(finished.get(key)?.length) && (detached.get(key) ?? 0) > 0 && (await $.clock.now()) - t0 < POLL_MAX_MS) await $.process.run(['sleep', '1']) // a $ call in flight keeps the hook inside its budget
     const got = finished.get(key) ?? []
     finished.set(key, [])
     const left = detached.get(key) ?? 0
     const lines = [...got, left ? `${left} script(s) still running in the background.` : '']
     return { result: lines.filter(Boolean).join('\n') || '(no pending events)' } as any
+  })
+
+  // Track whether the main loop is mid-turn; at a turn's end, hand over any background output that finished meanwhile.
+  on('turn.start', async ($, e: any, next) => {
+    if (e.agentId === undefined) { mainBusy = true; deliverer = $ }
+    return next(e)
+  })
+  on('turn.complete', async ($, e: any, next) => {
+    const r = await next(e)
+    if (e.agentId === undefined) {
+      mainBusy = false
+      deliverer = $
+      if (finished.get('main')?.length) $.clock.after(300, () => wake($))
+    }
+    return r
   })
 
   on('tool.call', { tool: EXEC }, async ($, e: any, next) => {

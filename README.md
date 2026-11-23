@@ -92,7 +92,7 @@ The script runs in a child with Node's permission model switched on, and everyth
 |---|---|
 | 🧠 **A persistent REPL** | Variables, functions and classes declared in one script are there in the next. I can load a big result once and keep slicing it. |
 | ⚡ **Parallel by default** | Top-level `await`, `Promise.all`, a hundred files read at once. |
-| 🌊 **Background scripts** | A script still running after 30 s detaches and keeps going (up to 2 h), and its output arrives through `poll`. The next script starts straight away. |
+| 🌊 **Background scripts** | A script still running after 30 s detaches and keeps going (up to 2 h), and its output is delivered on its own: with the model's next `exec` result if it is mid-turn, or as a new message that wakes the session once the turn has ended, just like a background Bash task. `poll` remains for blocking on a result and waits until one finishes (up to 10 min). The next script starts straight away. |
 | 🗜️ **Context that stays small** | Only `return` values, `text()` and `log()` come back to me. `preview(x, n)` keeps big results honest. |
 | 🔎 **Tool discovery** | `searchTools()` and `describeTool()` find any MCP or built-in tool from inside a script. |
 | 🗃️ **A tiny key-value store** | `store(k, v)` / `load(k)` survive across scripts (1 MiB cap). |
